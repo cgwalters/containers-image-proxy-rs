@@ -12,12 +12,13 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::prelude::{CommandExt, FromRawFd, RawFd};
+use std::os::unix::prelude::{CommandExt, FromRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufRead, AsyncReadExt};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 use tracing::instrument;
@@ -33,7 +34,7 @@ const MAX_MSG_SIZE: usize = 32 * 1024;
 static BASE_PROTO_VERSION: Lazy<semver::VersionReq> =
     Lazy::new(|| semver::VersionReq::parse("0.2.3").unwrap());
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Request {
     method: String,
     args: Vec<serde_json::Value>,
@@ -60,11 +61,11 @@ impl Request {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Reply {
     success: bool,
     error: String,
-    pipeid: u32,
+    pipe: Option<tokio_unix_ipc::serde::Handle<File>>,
     value: serde_json::Value,
 }
 
@@ -74,7 +75,8 @@ type ChildFuture = Pin<
 
 /// Manage a child process proxy to fetch container images.
 pub struct ImageProxy {
-    sockfd: Arc<Mutex<File>>,
+    send: tokio_unix_ipc::Sender<Request>,
+    recv: tokio_unix_ipc::Receiver<Reply>,
     childwait: Arc<AsyncMutex<ChildFuture>>,
     protover: semver::Version,
 }
@@ -202,7 +204,8 @@ impl ImageProxy {
     #[instrument]
     pub async fn new_with_config(config: ImageProxyConfig) -> Result<Self> {
         let mut c = Command::try_from(config)?;
-        let (mysock, theirsock) = new_seqpacket_pair()?;
+        let (mysock, theirsock) = std::os::unix::net::UnixStream::pair()?;
+        let theirsock = unsafe { File::from_raw_fd(theirsock.into_raw_fd()) };
         c.stdin(Stdio::from(theirsock));
         let child = c.spawn().context("Failed to spawn skopeo")?;
         tracing::debug!("Spawned skopeo pid={:?}", child.id());
@@ -211,10 +214,11 @@ impl ImageProxy {
         // which may also be in process.
         // xref https://github.com/tokio-rs/tokio/issues/3520#issuecomment-968985861
         let childwait = tokio::task::spawn_blocking(move || child.wait_with_output());
-        let sockfd = Arc::new(Mutex::new(mysock));
+        let (send, recv) = tokio_unix_ipc::channel_from_std(mysock)?;
 
         let mut r = Self {
-            sockfd,
+            send,
+            recv,
             childwait: Arc::new(AsyncMutex::new(Box::pin(childwait))),
             protover: semver::Version::new(0, 0, 0),
         };
@@ -236,60 +240,6 @@ impl ImageProxy {
         Ok(r)
     }
 
-    async fn impl_request_raw<T: serde::de::DeserializeOwned + Send + 'static>(
-        sockfd: Arc<Mutex<File>>,
-        req: Request,
-    ) -> Result<(T, Option<(File, u32)>)> {
-        tracing::trace!("sending request {}", req.method.as_str());
-        // TODO: Investigate https://crates.io/crates/uds for SOCK_SEQPACKET tokio
-        let r = tokio::task::spawn_blocking(move || {
-            let sockfd = sockfd.lock().unwrap();
-            let sendbuf = serde_json::to_vec(&req)?;
-            nixsocket::send(sockfd.as_raw_fd(), &sendbuf, nixsocket::MsgFlags::empty())?;
-            drop(sendbuf);
-            let mut buf = [0u8; MAX_MSG_SIZE];
-            let mut cmsg_buffer = nix::cmsg_space!([RawFd; 1]);
-            let iov = IoVec::from_mut_slice(buf.as_mut());
-            let r = nixsocket::recvmsg(
-                sockfd.as_raw_fd(),
-                &[iov],
-                Some(&mut cmsg_buffer),
-                nixsocket::MsgFlags::MSG_CMSG_CLOEXEC,
-            )?;
-            let buf = &buf[0..r.bytes];
-            let mut fdret: Option<File> = None;
-            for cmsg in r.cmsgs() {
-                if let Some(f) = file_from_scm_rights(cmsg) {
-                    fdret = Some(f);
-                    break;
-                }
-            }
-            let reply: Reply = serde_json::from_slice(buf).context("Deserializing reply")?;
-            if !reply.success {
-                return Err(anyhow!("remote error: {}", reply.error));
-            }
-            let fdret = match (fdret, reply.pipeid) {
-                (Some(fd), n) => {
-                    if n == 0 {
-                        return Err(anyhow!("got fd but no pipeid"));
-                    }
-                    Some((fd, n))
-                }
-                (None, n) => {
-                    if n != 0 {
-                        return Err(anyhow!("got no fd with pipeid {}", n));
-                    }
-                    None
-                }
-            };
-            let reply = serde_json::from_value(reply.value).context("Deserializing value")?;
-            Ok((reply, fdret))
-        })
-        .await??;
-        tracing::trace!("completed request");
-        Ok(r)
-    }
-
     #[instrument(skip(args))]
     async fn impl_request<R: serde::de::DeserializeOwned + Send + 'static, T, I>(
         &self,
@@ -300,11 +250,20 @@ impl ImageProxy {
         T: IntoIterator<Item = I>,
         I: Into<serde_json::Value>,
     {
-        let req = Self::impl_request_raw(Arc::clone(&self.sockfd), Request::new(method, args));
+        let req = async move {
+            self.send.send(Request::new(method, args)).await?;
+            self.recv.recv().await
+        };
         let mut childwait = self.childwait.lock().await;
         tokio::select! {
             r = req => {
-                Ok(r?)
+                let r = r?;
+                if !r.success {
+                    Err(anyhow!("remote error: {}", r.error))
+                } else {
+                    let value = serde_json::from_value(r.value).context("Deserializing value")?; 
+                    Ok((value, r.pipe))
+                }
             }
             r = childwait.as_mut() => {
                 let r = r??;
@@ -317,8 +276,8 @@ impl ImageProxy {
     #[instrument]
     async fn finish_pipe(&self, pipeid: u32) -> Result<()> {
         tracing::debug!("closing pipe");
-        let (r, fd) = self.impl_request("FinishPipe", [pipeid]).await?;
-        if fd.is_some() {
+        let r = self.impl_request("FinishPipe", [pipeid]).await?;
+        if r.pipefd.is_some() {
             return Err(anyhow!("Unexpected fd in finish_pipe reply"));
         }
         Ok(r)
@@ -350,8 +309,7 @@ impl ImageProxy {
     #[instrument]
     pub async fn close_image(&self, img: &OpenedImage) -> Result<()> {
         tracing::debug!("closing image");
-        let (r, _) = self.impl_request("CloseImage", [img.0]).await?;
-        Ok(r)
+        self.impl_request("CloseImage", [img.0]).await
     }
 
     async fn read_all_fd(&self, fd: Option<(File, u32)>) -> Result<Vec<u8>> {
@@ -433,12 +391,7 @@ impl ImageProxy {
     #[instrument]
     pub async fn finalize(self) -> Result<()> {
         let _ = &self;
-        let req = Request::new_bare("Shutdown");
-        let sendbuf = serde_json::to_vec(&req)?;
-        // SAFETY: Only panics if a worker thread already panic'd
-        let sockfd = Arc::try_unwrap(self.sockfd).unwrap().into_inner().unwrap();
-        nixsocket::send(sockfd.as_raw_fd(), &sendbuf, nixsocket::MsgFlags::empty())?;
-        drop(sendbuf);
+        let _ = self.send.send(Request::new_bare("Shutdown")).await;
         tracing::debug!("sent shutdown request");
         let mut childwait = self.childwait.lock().await;
         let output = childwait.as_mut().await??;
