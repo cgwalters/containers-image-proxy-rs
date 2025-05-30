@@ -256,7 +256,7 @@ impl TryFrom<ImageProxyConfig> for Command {
             unsafe {
                 c.pre_exec(|| {
                     rustix::process::set_parent_process_death_signal(Some(
-                        rustix::process::Signal::Term,
+                        rustix::process::Signal::TERM,
                     ))
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
                 });
@@ -473,8 +473,9 @@ impl ImageProxy {
             rustix::net::send(sockfd, &sendbuf, rustix::net::SendFlags::empty())?;
             drop(sendbuf);
             let mut buf = [0u8; MAX_MSG_SIZE];
-            let mut cmsg_space = vec![0; rustix::cmsg_space!(ScmRights(1))];
-            let mut cmsg_buffer = rustix::net::RecvAncillaryBuffer::new(&mut cmsg_space);
+            let mut cmsg_space: Vec<std::mem::MaybeUninit<u8>> =
+                vec![std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut cmsg_buffer = rustix::net::RecvAncillaryBuffer::new(cmsg_space.as_mut_slice());
             let iov = std::io::IoSliceMut::new(buf.as_mut());
             let mut iov = [iov];
             let nread = rustix::net::recvmsg(
